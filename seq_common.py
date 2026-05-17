@@ -1,12 +1,5 @@
 """
 seq_common.py - Shared utilities for all SEQ IPv4 merge implementations.
-
-This module is imported by:
-  - seq_solution_1_grace_hash.py
-  - seq_solution_2_unix_sort.py
-  - seq_solution_3_duckdb.py
-  - seq_solution_4_polars_isolated.py
-
 Put this in the same directory as the solution scripts.
 """
 
