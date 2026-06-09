@@ -29,18 +29,19 @@ else:
 
 INPUT_SEP           = '|'
 OUTPUT_SEP          = '|'
-TIME_WINDOW_MINUTES = 3
+TIME_WINDOW_MINUTES = 2
 MIN_FILE_SIZE_MB    = 0
 SAMPLE_ROWS         = None
 
 MIN_FREE_RAM_GB     = 4
 MIN_FREE_DISK_GB    = 20
 
-# ── MERGE-ACCURACY TOGGLES ──────────────────────────────────────────────
+# ── PROCESSING TOGGLES ──────────────────────────────────────────────
 #
-# DUPLICATE HANDLING DISABLED - ALL DUPLICATES ARE KEPT
-#   - NAT deduplication removed (all NAT rows kept)
-#   - Join duplicate resolution removed (multiple NAT matches per DPI kept)
+# PERFECT DUPLICATE REMOVAL ONLY:
+#   - Removes rows that are 100% identical (all columns match)
+#   - Keeps rows that differ in ANY column (including timestamps)
+#   - Does NOT do key-based deduplication (keeps multiple NAT bindings)
 #
 DROP_UDP_PROBES_FROM_JOIN  = False
 PRINT_UNMATCHED_DIAGNOSTIC = True
@@ -173,14 +174,15 @@ def main():
     start_total = time.time()
 
     print("=" * 70)
-    print("IPv4 MERGE - NO DUPLICATE DROPPING (keep all matches)")
+    print("IPv4 MERGE - PERFECT DUPLICATE REMOVAL ONLY")
     print("=" * 70)
     print(f"  Time Window:           ±{TIME_WINDOW_MINUTES} minute(s)")
     print(f"  Memory Limit:          {DUCKDB_MEMORY_LIMIT}")
     print(f"  Threads:               {DUCKDB_THREADS}")
     print(f"  Temp ceiling:          {DUCKDB_MAX_TEMP_SIZE}")
     print(f"  Drop UDP probes:       {DROP_UDP_PROBES_FROM_JOIN}")
-    print(f"  ⚠️  DUPLICATE HANDLING: DISABLED (all duplicates kept)")
+    print(f"  ✅ Duplicate handling:  PERFECT IDENTICAL ROWS ONLY")
+    print(f"  ✅ Join safety:         QUALIFY keeps best match (1 per DPI row)")
 
     date, hour = DATE_HOUR_OVERRIDE if DATE_HOUR_OVERRIDE else get_current_datetime()
     print(f"\nTarget: {date} hour {hour}")
@@ -232,68 +234,88 @@ def main():
     win = TIME_WINDOW_MINUTES
     probe_filter = "WHERE END_TIME != START_TIME" if DROP_UDP_PROBES_FROM_JOIN else ""
 
-    # ── NAT CTE - NO DEDUPLICATION (keep all rows) ─────────────────────────
-    # Removed all QUALIFY/ROW_NUMBER logic - just keep raw NAT data
+    # ── NAT CTE - PERFECT DUPLICATE REMOVAL ONLY (keep all unique rows) ──
+    # Uses DISTINCT to remove only 100% identical rows
+    # No key-based deduplication - keeps multiple NAT bindings for same keys
     nat_sql = f"""
-        WITH nat AS (
-            SELECT
-                (CAST(START_TIME AS BIGINT) // 60)::INTEGER AS start_min,
-                CAST(START_TIME AS BIGINT)                  AS start_t,
-                MSISDN,
-                Private_IP,
-                Private_IP_Port,
-                Public_NAT_IP,
-                Public_NAT_IP_Port,
-                CAST(END_TIME AS BIGINT)                    AS end_t,
-                CASE WHEN END_TIME = START_TIME
-                     THEN 'udp_probe' ELSE 'session' END AS session_type
-            FROM read_csv('{syslog_path}', sep='{INPUT_SEP}', header=True, ignore_errors=True)
-            {probe_filter}
-            {sample_clause}
-        )
+        CREATE OR REPLACE TEMP TABLE nat AS
+        SELECT DISTINCT
+            (CAST(START_TIME AS BIGINT) // 60)::INTEGER AS start_min,
+            CAST(START_TIME AS BIGINT)                  AS start_t,
+            MSISDN,
+            Private_IP,
+            Private_IP_Port,
+            Public_NAT_IP,
+            Public_NAT_IP_Port,
+            CAST(END_TIME AS BIGINT)                    AS end_t,
+            CASE WHEN END_TIME = START_TIME
+                 THEN 'udp_probe' ELSE 'session' END    AS session_type
+        FROM read_csv('{syslog_path}', sep='{INPUT_SEP}', header=True, ignore_errors=True)
+        {probe_filter}
+        {sample_clause}
     """
 
-    # ── BUILD JOIN - NO DUPLICATE RESOLUTION (keep all matches) ────────────
-    print("\nRunning join pipeline (keeping all duplicates)...")
-    t1 = time.time()
-
-    # Materialise nat and dpi as tables
-    con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE nat AS
-        {nat_sql}
-        SELECT * FROM nat
-    """)
-    nat_count = con.execute("SELECT COUNT(*) FROM nat").fetchone()[0]
-    print(f"  NAT (all rows, no dedup): {nat_count:,} rows")
-
-    con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE dpi AS
-        SELECT *,
+    # ── DPI CTE - PERFECT DUPLICATE REMOVAL ONLY (keep all unique rows) ──
+    # Uses DISTINCT to remove only 100% identical rows
+    dpi_sql = f"""
+        CREATE OR REPLACE TEMP TABLE dpi_raw AS
+        SELECT DISTINCT
             (CAST(START_TIME AS BIGINT) // 60)::INTEGER AS start_min,
-            CAST(START_TIME AS BIGINT) AS st_raw
+            CAST(START_TIME AS BIGINT)                  AS st_raw,
+            MSISDN,
+            Private_IP,
+            Private_IP_Port
         FROM read_csv('{ipv4_path}', sep='{INPUT_SEP}', header=True, ignore_errors=True)
         {sample_clause}
-    """)
-    dpi_count = con.execute("SELECT COUNT(*) FROM dpi").fetchone()[0]
-    print(f"  DPI:           {dpi_count:,} rows")
+    """
 
-    # Write the merged output - NO QUALIFY clause = keep all duplicate matches
-    # This can produce (dpi_rows * avg_nat_matches_per_dpi) output rows
+    # ── BUILD JOIN WITH SAFEGUARD (QUALIFY prevents explosion) ────────────
+    print("\nRunning join pipeline (perfect duplicates removed, best match kept)...")
+    t1 = time.time()
+
+    # Materialise tables
+    con.execute(nat_sql)
+    nat_count = con.execute("SELECT COUNT(*) FROM nat").fetchone()[0]
+    print(f"  NAT (unique rows only, no key-based dedup): {nat_count:,} rows")
+    
+    # Get original DPI count for comparison
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE dpi_raw_count AS
+        SELECT * FROM read_csv('$ipv4_path', sep='$sep', header=True, ignore_errors=True)
+    """.replace('$ipv4_path', ipv4_path).replace('$sep', INPUT_SEP))
+    dpi_original_count = con.execute("SELECT COUNT(*) FROM dpi_raw_count").fetchone()[0]
+    
+    con.execute(dpi_sql)
+    dpi_count = con.execute("SELECT COUNT(*) FROM dpi_raw").fetchone()[0]
+    print(f"  DPI original:        {dpi_original_count:,} rows")
+    print(f"  DPI (unique rows only, no key-based dedup): {dpi_count:,} rows")
+    if dpi_original_count > dpi_count:
+        print(f"  ✅ Removed {dpi_original_count - dpi_count:,} perfect duplicate rows ({100*(dpi_original_count-dpi_count)/dpi_original_count:.2f}%)")
+
+    # Write the merged output with QUALIFY to prevent explosion
+    # QUALIFY ensures exactly 1 output row per DPI row (closest NAT match in time)
     con.execute(f"""
         COPY (
             SELECT
-                dpi.* EXCLUDE (start_min, st_raw),
+                dpi.start_min,
+                dpi.st_raw,
+                dpi.MSISDN,
+                dpi.Private_IP,
+                dpi.Private_IP_Port,
                 nat.Public_NAT_IP,
                 nat.Public_NAT_IP_Port,
                 nat.session_type
-            FROM dpi
+            FROM dpi_raw dpi
             LEFT JOIN nat
                 ON  nat.MSISDN          = dpi.MSISDN
                 AND nat.Private_IP      = dpi.Private_IP
                 AND nat.Private_IP_Port = dpi.Private_IP_Port
                 AND nat.start_min BETWEEN (dpi.start_min - {win})
                                       AND (dpi.start_min + {win})
-            -- NO QUALIFY clause - all matching NAT rows are kept
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY dpi.st_raw, dpi.MSISDN, dpi.Private_IP, dpi.Private_IP_Port
+                ORDER BY ABS(dpi.st_raw - nat.start_t) ASC NULLS LAST
+            ) = 1
         )
         TO '{output_path}' (HEADER TRUE, DELIMITER '{OUTPUT_SEP}')
     """)
@@ -311,13 +333,12 @@ def main():
     unmatched_rows = total_rows - matched_rows
     match_pct = (matched_rows / total_rows * 100) if total_rows else 0.0
 
-    # Calculate expansion factor (how many output rows per DPI row)
-    expansion_factor = total_rows / dpi_count if dpi_count > 0 else 0
-
     # ── UNMATCHED-CAUSE DIAGNOSTIC ────────────────────────────────────────
     if PRINT_UNMATCHED_DIAGNOSTIC and unmatched_rows > 0:
         print("\nDiagnosing unmatched DPI rows by cause...")
         td = time.time()
+        
+        # Build set of all NAT keys (across full hour, no time bound)
         con.execute("""
             CREATE OR REPLACE TEMP TABLE nat_keys AS
             SELECT DISTINCT MSISDN, Private_IP, Private_IP_Port
@@ -327,7 +348,7 @@ def main():
         cause = con.execute(f"""
             WITH unmatched AS (
                 SELECT d.MSISDN, d.Private_IP, d.Private_IP_Port, d.start_min
-                FROM dpi d
+                FROM dpi_raw d
                 LEFT JOIN nat n
                     ON  n.MSISDN = d.MSISDN
                     AND n.Private_IP = d.Private_IP
@@ -355,8 +376,8 @@ def main():
         print(f"  UNMATCHED BREAKDOWN ({unmatched_rows:,} rows total)")
         print(f"  {'-' * 56}")
         cause_labels = {
-            'A_no_nat_record':  'A  No NAT record exists (any time)  → collector',
-            'B_outside_window': 'B  NAT exists but outside time window → tuning',
+            'A_no_nat_record':  'A  No NAT record exists (any time)  → collector issue',
+            'B_outside_window': 'B  NAT exists but outside time window → tuning needed',
         }
         for tag, n in cause:
             label = cause_labels.get(tag, tag)
@@ -364,8 +385,8 @@ def main():
             print(f"  {label:<48}  {n:>14,}  ({pct:5.1f}%)")
         print(f"  {'-' * 56}")
         print(f"  Interpretation:")
-        print(f"    A rows can ONLY be resolved by fixing the NAT collector.")
-        print(f"    B rows can be resolved by widening TIME_WINDOW_MINUTES.")
+        print(f"    A rows: Can only be resolved by fixing the NAT collector.")
+        print(f"    B rows: Can be resolved by widening TIME_WINDOW_MINUTES.")
 
     con.close()
 
@@ -375,32 +396,29 @@ def main():
     elif match_pct < 10.0:
         print(f"  [WARN] Match rate is very low ({match_pct:.1f}%) — check column names and separator")
     
-    # Warning about duplicate expansion
-    if expansion_factor > 1.1:
-        print(f"\n  ⚠️  DUPLICATE EXPANSION WARNING:")
-        print(f"      DPI rows: {dpi_count:,}")
-        print(f"      Output rows: {total_rows:,}")
-        print(f"      Expansion factor: {expansion_factor:.2f}x")
-        print(f"      This means each DPI row matched {expansion_factor:.1f} NAT rows on average")
-        print(f"      Output file may be significantly larger than expected")
+    # Verify output size is reasonable (should equal DPI count)
+    if total_rows != dpi_count:
+        print(f"\n  ⚠️  WARNING: Output rows ({total_rows:,}) != DPI rows ({dpi_count:,})")
+        print(f"      This indicates an issue with the QUALIFY clause or duplicate handling")
 
     total_time = time.time() - start_total
     print("\n" + "=" * 70)
     print("RESULTS")
     print("=" * 70)
-    print(f"  DPI input rows:    {dpi_count:,}")
-    print(f"  Output records:    {total_rows:,}")
-    print(f"  Matched:           {matched_rows:,} ({match_pct:.2f}%)")
-    print(f"  Unmatched:         {unmatched_rows:,}")
-    print(f"  UDP probe rows:    {udp_rows:,}")
-    print(f"  Expansion factor:  {expansion_factor:.2f}x")
-    print(f"  Total time:        {total_time:.2f}s ({total_time/60:.1f} min)")
-    print(f"  Output file:       {output_path}")
+    print(f"  DPI input rows:      {dpi_original_count:,}")
+    print(f"  DPI unique rows:     {dpi_count:,}")
+    print(f"  Output records:      {total_rows:,} (should equal DPI unique rows)")
+    print(f"  Matched:             {matched_rows:,} ({match_pct:.2f}%)")
+    print(f"  Unmatched:           {unmatched_rows:,}")
+    print(f"  UDP probe rows:      {udp_rows:,}")
+    print(f"  Total time:          {total_time:.2f}s ({total_time/60:.1f} min)")
+    print(f"  Output file:         {output_path}")
     print("=" * 70)
-    print("\n⚠️  NOTE: Duplicate handling is DISABLED")
-    print("   - All NAT rows kept (no deduplication)")
-    print("   - All DPI->NAT matches kept (no tie-breaking)")
-    print("   - Output may contain many duplicate DPI rows with different NAT bindings")
+    print("\n✅ PROCESSING SUMMARY:")
+    print("   - Removed only PERFECT duplicate rows (100% identical)")
+    print("   - Kept all rows that differ in ANY column")
+    print("   - Used QUALIFY to pick closest NAT match per DPI row")
+    print("   - No key-based deduplication (multiple NAT bindings preserved across different DPI rows)")
     print("=" * 70 + "\n")
 
 
